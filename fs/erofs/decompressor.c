@@ -122,11 +122,11 @@ static int z_erofs_lz4_prepare_dstpages(struct z_erofs_lz4_decompress_ctx *ctx,
 }
 
 static void *z_erofs_lz4_handle_overlap(struct z_erofs_lz4_decompress_ctx *ctx,
-			void *inpage, void *out, unsigned int *inputmargin,
-			int *maptype, bool may_inplace)
+			void *inpage, unsigned int *inputmargin, int *maptype,
+			bool may_inplace)
 {
 	struct z_erofs_decompress_req *rq = ctx->rq;
-	unsigned int omargin, total, i;
+	unsigned int omargin, total, i, j;
 	struct page **in;
 	void *src, *tmp;
 
@@ -136,20 +136,20 @@ static void *z_erofs_lz4_handle_overlap(struct z_erofs_lz4_decompress_ctx *ctx,
 		    omargin < LZ4_DECOMPRESS_INPLACE_MARGIN(rq->inputsize))
 			goto docopy;
 
-		for (i = 0; i < ctx->inpages; ++i)
-			if (rq->out[ctx->outpages - ctx->inpages + i] !=
-			    rq->in[i])
-				goto docopy;
-		kunmap_local(inpage);
-		*maptype = 3;
-		return out + ((ctx->outpages - ctx->inpages) << PAGE_SHIFT);
+		for (i = 0; i < ctx->inpages; ++i) {
+			DBG_BUGON(rq->in[i] == NULL);
+			for (j = 0; j < ctx->outpages - ctx->inpages + i; ++j)
+				if (rq->out[j] == rq->in[i])
+					goto docopy;
+		}
 	}
 
 	if (ctx->inpages <= 1) {
 		*maptype = 0;
 		return inpage;
 	}
-	kunmap_local(inpage);
+	kunmap_atomic(inpage);
+	might_sleep();
 	src = erofs_vm_map_ram(rq->in, ctx->inpages);
 	if (!src)
 		return ERR_PTR(-ENOMEM);
@@ -162,7 +162,7 @@ docopy:
 	src = erofs_get_pcpubuf(ctx->inpages);
 	if (!src) {
 		DBG_BUGON(1);
-		kunmap_local(inpage);
+		kunmap_atomic(inpage);
 		return ERR_PTR(-EFAULT);
 	}
 
@@ -173,9 +173,9 @@ docopy:
 			min_t(unsigned int, total, PAGE_SIZE - *inputmargin);
 
 		if (!inpage)
-			inpage = kmap_local_page(*in);
+			inpage = kmap_atomic(*in);
 		memcpy(tmp, inpage + *inputmargin, page_copycnt);
-		kunmap_local(inpage);
+		kunmap_atomic(inpage);
 		inpage = NULL;
 		tmp += page_copycnt;
 		total -= page_copycnt;
@@ -205,16 +205,16 @@ int z_erofs_fixup_insize(struct z_erofs_decompress_req *rq, const char *padbuf,
 }
 
 static int z_erofs_lz4_decompress_mem(struct z_erofs_lz4_decompress_ctx *ctx,
-				      u8 *dst)
+				      u8 *out)
 {
 	struct z_erofs_decompress_req *rq = ctx->rq;
 	bool support_0padding = false, may_inplace = false;
 	unsigned int inputmargin;
-	u8 *out, *headpage, *src;
+	u8 *headpage, *src;
 	int ret, maptype;
 
 	DBG_BUGON(*rq->in == NULL);
-	headpage = kmap_local_page(*rq->in);
+	headpage = kmap_atomic(*rq->in);
 
 	/* LZ4 decompression inplace is only safe if zero_padding is enabled */
 	if (erofs_sb_has_zero_padding(EROFS_SB(rq->sb))) {
@@ -223,7 +223,7 @@ static int z_erofs_lz4_decompress_mem(struct z_erofs_lz4_decompress_ctx *ctx,
 				min_t(unsigned int, rq->inputsize,
 				      rq->sb->s_blocksize - rq->pageofs_in));
 		if (ret) {
-			kunmap_local(headpage);
+			kunmap_atomic(headpage);
 			return ret;
 		}
 		may_inplace = !((rq->pageofs_in + rq->inputsize) &
@@ -231,12 +231,11 @@ static int z_erofs_lz4_decompress_mem(struct z_erofs_lz4_decompress_ctx *ctx,
 	}
 
 	inputmargin = rq->pageofs_in;
-	src = z_erofs_lz4_handle_overlap(ctx, headpage, dst, &inputmargin,
+	src = z_erofs_lz4_handle_overlap(ctx, headpage, &inputmargin,
 					 &maptype, may_inplace);
 	if (IS_ERR(src))
 		return PTR_ERR(src);
 
-	out = dst + rq->pageofs_out;
 	/* legacy format could compress extra data in a pcluster. */
 	if (rq->partial_decoding || !support_0padding)
 		ret = LZ4_decompress_safe_partial(src + inputmargin, out,
@@ -262,12 +261,12 @@ static int z_erofs_lz4_decompress_mem(struct z_erofs_lz4_decompress_ctx *ctx,
 	}
 
 	if (maptype == 0) {
-		kunmap_local(headpage);
+		kunmap_atomic(headpage);
 	} else if (maptype == 1) {
 		vm_unmap_ram(src, ctx->inpages);
 	} else if (maptype == 2) {
 		erofs_put_pcpubuf(src);
-	} else if (maptype != 3) {
+	} else {
 		DBG_BUGON(1);
 		return -EFAULT;
 	}
@@ -290,7 +289,7 @@ static int z_erofs_lz4_decompress(struct z_erofs_decompress_req *rq,
 	/* one optimized fast path only for non bigpcluster cases yet */
 	if (ctx.inpages == 1 && ctx.outpages == 1 && !rq->inplace_io) {
 		DBG_BUGON(!*rq->out);
-		dst = kmap_local_page(*rq->out);
+		dst = kmap_atomic(*rq->out);
 		dst_maptype = 0;
 		goto dstmap_out;
 	}
@@ -310,9 +309,9 @@ static int z_erofs_lz4_decompress(struct z_erofs_decompress_req *rq,
 	}
 
 dstmap_out:
-	ret = z_erofs_lz4_decompress_mem(&ctx, dst);
+	ret = z_erofs_lz4_decompress_mem(&ctx, dst + rq->pageofs_out);
 	if (!dst_maptype)
-		kunmap_local(dst);
+		kunmap_atomic(dst);
 	else if (dst_maptype == 2)
 		vm_unmap_ram(dst, ctx.outpages);
 	return ret;
@@ -321,63 +320,50 @@ dstmap_out:
 static int z_erofs_transform_plain(struct z_erofs_decompress_req *rq,
 				   struct page **pagepool)
 {
-	const unsigned int nrpages_in =
-		PAGE_ALIGN(rq->pageofs_in + rq->inputsize) >> PAGE_SHIFT;
-	const unsigned int nrpages_out =
+	const unsigned int inpages = PAGE_ALIGN(rq->inputsize) >> PAGE_SHIFT;
+	const unsigned int outpages =
 		PAGE_ALIGN(rq->pageofs_out + rq->outputsize) >> PAGE_SHIFT;
-	const unsigned int bs = rq->sb->s_blocksize;
-	unsigned int cur = 0, ni = 0, no, pi, po, insz, cnt;
-	u8 *kin;
+	const unsigned int righthalf = min_t(unsigned int, rq->outputsize,
+					     PAGE_SIZE - rq->pageofs_out);
+	const unsigned int lefthalf = rq->outputsize - righthalf;
+	const unsigned int interlaced_offset =
+		rq->alg == Z_EROFS_COMPRESSION_SHIFTED ? 0 : rq->pageofs_out;
+	unsigned char *src, *dst;
 
-	DBG_BUGON(rq->outputsize > rq->inputsize);
-	if (rq->alg == Z_EROFS_COMPRESSION_INTERLACED) {
-		cur = bs - (rq->pageofs_out & (bs - 1));
-		pi = (rq->pageofs_in + rq->inputsize - cur) & ~PAGE_MASK;
-		cur = min(cur, rq->outputsize);
-		if (cur && rq->out[0]) {
-			kin = kmap_local_page(rq->in[nrpages_in - 1]);
-			if (rq->out[0] == rq->in[nrpages_in - 1]) {
-				memmove(kin + rq->pageofs_out, kin + pi, cur);
-				flush_dcache_page(rq->out[0]);
-			} else {
-				memcpy_to_page(rq->out[0], rq->pageofs_out,
-					       kin + pi, cur);
-			}
-			kunmap_local(kin);
+	if (outpages > 2 && rq->alg == Z_EROFS_COMPRESSION_SHIFTED) {
+		DBG_BUGON(1);
+		return -EFSCORRUPTED;
+	}
+
+	if (rq->out[0] == *rq->in) {
+		DBG_BUGON(rq->pageofs_out);
+		return 0;
+	}
+
+	src = kmap_local_page(rq->in[inpages - 1]) + rq->pageofs_in;
+	if (rq->out[0]) {
+		dst = kmap_local_page(rq->out[0]);
+		memcpy(dst + rq->pageofs_out, src + interlaced_offset,
+		       righthalf);
+		kunmap_local(dst);
+	}
+
+	if (outpages > inpages) {
+		DBG_BUGON(!rq->out[outpages - 1]);
+		if (rq->out[outpages - 1] != rq->in[inpages - 1]) {
+			dst = kmap_local_page(rq->out[outpages - 1]);
+			memcpy(dst, interlaced_offset ? src :
+					(src + righthalf), lefthalf);
+			kunmap_local(dst);
+		} else if (!interlaced_offset) {
+			memmove(src, src + righthalf, lefthalf);
 		}
-		rq->outputsize -= cur;
 	}
-
-	for (; rq->outputsize; rq->pageofs_in = 0, cur += PAGE_SIZE, ni++) {
-		insz = min_t(unsigned int, PAGE_SIZE - rq->pageofs_in,
-			     rq->outputsize);
-		rq->outputsize -= insz;
-		if (!rq->in[ni])
-			continue;
-		kin = kmap_local_page(rq->in[ni]);
-		pi = 0;
-		do {
-			no = (rq->pageofs_out + cur + pi) >> PAGE_SHIFT;
-			po = (rq->pageofs_out + cur + pi) & ~PAGE_MASK;
-			DBG_BUGON(no >= nrpages_out);
-			cnt = min_t(unsigned int, insz - pi, PAGE_SIZE - po);
-			if (rq->out[no] == rq->in[ni]) {
-				memmove(kin + po,
-					kin + rq->pageofs_in + pi, cnt);
-				flush_dcache_page(rq->out[no]);
-			} else if (rq->out[no]) {
-				memcpy_to_page(rq->out[no], po,
-					       kin + rq->pageofs_in + pi, cnt);
-			}
-			pi += cnt;
-		} while (pi < insz);
-		kunmap_local(kin);
-	}
-	DBG_BUGON(ni > nrpages_in);
+	kunmap_local(src);
 	return 0;
 }
 
-const struct z_erofs_decompressor erofs_decompressors[] = {
+static struct z_erofs_decompressor decompressors[] = {
 	[Z_EROFS_COMPRESSION_SHIFTED] = {
 		.decompress = z_erofs_transform_plain,
 		.name = "shifted"
@@ -397,3 +383,9 @@ const struct z_erofs_decompressor erofs_decompressors[] = {
 	},
 #endif
 };
+
+int z_erofs_decompress(struct z_erofs_decompress_req *rq,
+		       struct page **pagepool)
+{
+	return decompressors[rq->alg].decompress(rq, pagepool);
+}

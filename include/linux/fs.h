@@ -1385,6 +1385,9 @@ extern int send_sigurg(struct fown_struct *fown);
  * sb->s_flags.  Note that these mirror the equivalent MS_* flags where
  * represented in both.
  */
+#ifdef CONFIG_BLOCKIO_UX_OPT
+#define SB_UX	(1<<20)	/* Indicate ux flag for decompress workqueue */
+#endif
 #define SB_RDONLY       BIT(0)	/* Mount read-only */
 #define SB_NOSUID       BIT(1)	/* Ignore suid and sgid bits */
 #define SB_NODEV        BIT(2)	/* Disallow access to device special files */
@@ -2306,6 +2309,9 @@ struct super_operations {
 #define S_CASEFOLD	(1 << 15) /* Casefolded file */
 #define S_VERITY	(1 << 16) /* Verity file (using fs/verity/) */
 #define S_KERNEL_FILE	(1 << 17) /* File is in use by the kernel (eg. fs/cachefiles) */
+#ifdef CONFIG_BLOCKIO_UX_OPT
+#define S_MEMPROTECT	(1 << 18) /* page protect (using mm/) */
+#endif
 
 /*
  * Note that nosuid etc flags are inode-specific: setting some file-system
