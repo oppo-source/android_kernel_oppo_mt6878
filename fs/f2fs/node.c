@@ -753,6 +753,38 @@ got:
 	return level;
 }
 
+#ifdef CONFIG_F2FS_SEQZONE
+u32 seqzone_index(struct inode *inode,
+			struct page *node_page, unsigned int offset)
+{
+	struct f2fs_node *raw_node;
+	__le32 *addr_array;
+	int base = 0;
+	bool is_inode = IS_INODE(node_page);
+	int addrs = DEF_ADDRS_PER_BLOCK / 2;
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+	raw_node = F2FS_NODE(node_page);
+
+	if (is_inode) {
+		int xattr_addrs = 0;
+		if (f2fs_sb_has_flexible_inline_xattr(sbi))
+			xattr_addrs = le16_to_cpu(raw_node->i.i_inline_xattr_size);
+		else if (raw_node->i.i_inline & F2FS_INLINE_XATTR)
+			xattr_addrs = DEFAULT_INLINE_XATTR_ADDRS;
+
+		if (!inode)
+			/* from GC path only */
+			base = offset_in_addr(&raw_node->i);
+		else if (f2fs_has_extra_attr(inode))
+			base = get_extra_isize(inode);
+		addrs = (DEF_ADDRS_PER_INODE - base - xattr_addrs) / 2;
+	}
+
+	addr_array = blkaddr_in_node(raw_node);
+	return le32_to_cpu(addr_array[base + offset + addrs]);
+}
+#endif
+
 /*
  * Caller should call f2fs_put_dnode(dn).
  * Also, it should grab and release a rwsem by calling f2fs_lock_op() and
@@ -798,6 +830,16 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 	/* get indirect or direct nodes */
 	for (i = 1; i <= level; i++) {
 		bool done = false;
+
+		if (nids[i] && nids[i] == dn->inode->i_ino) {
+			err = -EFSCORRUPTED;
+			f2fs_err(sbi,
+				"inode mapping table is corrupted, run fsck to fix it, "
+				"ino:%lu, nid:%u, level:%d, offset:%d",
+				dn->inode->i_ino, nids[i], level, offset[level]);
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+			goto release_pages;
+		}
 
 		if (!nids[i] && mode == ALLOC_NODE) {
 			/* alloc new node */
@@ -876,6 +918,11 @@ int f2fs_get_dnode_of_data(struct dnode_of_data *dn, pgoff_t index, int mode)
 		f2fs_update_read_extent_tree_range_compressed(dn->inode,
 					fofs, blkaddr, cluster_size, c_len);
 	}
+#ifdef CONFIG_F2FS_SEQZONE
+	if (f2fs_seqzone_file(dn->inode))
+		dn->seqzone_index = seqzone_index(dn->inode,
+					dn->node_page, dn->ofs_in_node);
+#endif
 out:
 	return 0;
 
@@ -906,7 +953,7 @@ static int truncate_node(struct dnode_of_data *dn)
 		return err;
 
 	/* Deallocate node address */
-	f2fs_invalidate_blocks(sbi, ni.blk_addr);
+	f2fs_invalidate_blocks(sbi, ni.blk_addr, 1);
 	dec_valid_node_count(sbi, dn->inode, dn->nid == dn->inode->i_ino);
 	set_node_addr(sbi, &ni, NULL_ADDR, false);
 
@@ -1114,7 +1161,14 @@ int f2fs_truncate_inode_blocks(struct inode *inode, pgoff_t from)
 	trace_f2fs_truncate_inode_blocks_enter(inode, from);
 
 	level = get_node_path(inode, from, offset, noffset);
-	if (level < 0) {
+	if (level <= 0) {
+		if (!level) {
+			level = -EFSCORRUPTED;
+			f2fs_err(sbi, "%s: inode ino=%lx has corrupted node block, from:%lu addrs:%u",
+					__func__, inode->i_ino,
+					from, ADDRS_PER_INODE(inode));
+			set_sbi_flag(sbi, SBI_NEED_FSCK);
+		}
 		trace_f2fs_truncate_inode_blocks_exit(inode, level);
 		return level;
 	}
@@ -2723,7 +2777,7 @@ int f2fs_recover_xattr_data(struct inode *inode, struct page *page)
 	if (err)
 		return err;
 
-	f2fs_invalidate_blocks(sbi, ni.blk_addr);
+	f2fs_invalidate_blocks(sbi, ni.blk_addr, 1);
 	dec_valid_node_count(sbi, inode, false);
 	set_node_addr(sbi, &ni, NULL_ADDR, false);
 

@@ -47,6 +47,10 @@
 
 static inline bool arch_thp_swp_supported(void)
 {
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+	/* even we have MTE, we don't use MTE */
+	return true;
+#endif
 	return !system_supports_mte();
 }
 #define arch_thp_swp_supported arch_thp_swp_supported
@@ -681,7 +685,8 @@ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
 	pr_err("%s:%d: bad pmd %016llx.\n", __FILE__, __LINE__, pmd_val(e))
 
 #define pud_none(pud)		(!pud_val(pud))
-#define pud_bad(pud)		(!pud_table(pud))
+#define pud_bad(pud)		((pud_val(pud) & PUD_TYPE_MASK) != \
+				 PUD_TYPE_TABLE)
 #define pud_present(pud)	pte_present(pud_pte(pud))
 #define pud_leaf(pud)		(pud_present(pud) && !pud_table(pud))
 #define pud_valid(pud)		pte_valid(pud_pte(pud))
@@ -893,6 +898,15 @@ static inline int __ptep_test_and_clear_young(pte_t *ptep)
 	pte = READ_ONCE(*ptep);
 	do {
 		old_pte = pte;
+#ifdef CONFIG_CONT_PTE_HUGEPAGE
+		/*
+		 * we have seen a swapentry's bit3, which is AF bit(10) in pte,
+		 * is incorrectly cleared. This sets swapoffset to 0-1-2-3-0-1
+		 * -2-3-8-9-10-11-8-9-10-11 for a hugepage.
+		 */
+		if (WARN_ON(!pte_present(pte)))
+			return false;
+#endif
 		pte = pte_mkold(pte);
 		pte_val(pte) = cmpxchg_relaxed(&pte_val(*ptep),
 					       pte_val(old_pte), pte_val(pte));

@@ -555,6 +555,19 @@ struct vm_area_struct {
 	ANDROID_KABI_RESERVE(4);
 } __randomize_layout;
 
+/**
+ * struct mm_struct_abi_extend will NEVER be exposed to vendor modules, except
+ * possibly via an opaque pointer. Their definitions can therefore be hidden
+ * from MODVERSIONS CRC machinery, allowing arbitrary future changes.
+ */
+#ifdef __GENKSYMS__
+struct mm_struct_abi_extend;
+#else
+struct mm_struct_abi_extend {
+	struct task_dma_buf_info *dmabuf_info;
+};
+#endif
+
 struct kioctx_table;
 struct mm_struct {
 	struct {
@@ -781,7 +794,7 @@ struct mm_struct {
 		} lru_gen;
 #endif /* CONFIG_LRU_GEN */
 
-		ANDROID_KABI_RESERVE(1);
+		ANDROID_KABI_USE(1, struct mm_struct_abi_extend *abi_extend);
 	} __randomize_layout;
 
 	/*
@@ -946,6 +959,7 @@ enum vm_fault_reason {
 	VM_FAULT_DONE_COW       = (__force vm_fault_t)0x001000,
 	VM_FAULT_NEEDDSYNC      = (__force vm_fault_t)0x002000,
 	VM_FAULT_COMPLETED      = (__force vm_fault_t)0x004000,
+	VM_FAULT_RETRY_VMA      = (__force vm_fault_t)0x008000,
 	VM_FAULT_HINDEX_MASK    = (__force vm_fault_t)0x0f0000,
 };
 
