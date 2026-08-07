@@ -823,6 +823,13 @@ static int verity_map(struct dm_target *ti, struct bio *bio)
 	return DM_MAPIO_SUBMITTED;
 }
 
+static void verity_postsuspend(struct dm_target *ti)
+{
+	struct dm_verity *v = ti->private;
+	flush_workqueue(v->verify_wq);
+	dm_bufio_client_reset(v->bufio);
+}
+
 /*
  * Status: V (valid) or C (corruption found)
  */
@@ -1210,6 +1217,10 @@ static int verity_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sector_t hash_position;
 	char dummy;
 	char *root_hash_digest_to_validate;
+#ifdef CONFIG_BLOCKIO_UX_OPT
+	static atomic_t verity_wq_id = ATOMIC_INIT(0);
+	char *verity_wq_name;
+#endif
 
 	v = kzalloc(sizeof(struct dm_verity), GFP_KERNEL);
 	if (!v) {
@@ -1463,7 +1474,12 @@ static int verity_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 * will fall-back to using it for error handling (or if the bufio cache
 	 * doesn't have required hashes).
 	 */
+#ifdef CONFIG_BLOCKIO_UX_OPT
+	verity_wq_name = kasprintf(GFP_KERNEL, "kverityd%d", atomic_add_return(1, &verity_wq_id));
+	v->verify_wq = alloc_workqueue(verity_wq_name, WQ_MEM_RECLAIM | WQ_HIGHPRI | WQ_UX | WQ_UNBOUND | WQ_SYSFS, 0);
+#else
 	v->verify_wq = alloc_workqueue("kverityd", WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
+#endif
 	if (!v->verify_wq) {
 		ti->error = "Cannot allocate workqueue";
 		r = -ENOMEM;
@@ -1538,6 +1554,7 @@ static struct target_type verity_target = {
 	.ctr		= verity_ctr,
 	.dtr		= verity_dtr,
 	.map		= verity_map,
+	.postsuspend	= verity_postsuspend,
 	.status		= verity_status,
 	.prepare_ioctl	= verity_prepare_ioctl,
 	.iterate_devices = verity_iterate_devices,
